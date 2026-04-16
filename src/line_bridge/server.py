@@ -68,6 +68,14 @@ async def _line_reply(reply_token: str, text: str) -> dict:
     })
 
 
+async def _line_loading(user_id: str, seconds: int = 60) -> None:
+    """Show a typing indicator to the user for up to 60 s while we wait on Claude."""
+    try:
+        await _line_post("/chat/loading/start", {"chatId": user_id, "loadingSeconds": min(60, seconds)})
+    except Exception as exc:
+        log.warning("loading indicator failed: %s", exc)
+
+
 # ── MCP ───────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -149,7 +157,9 @@ async def _handle_message_event(event: dict) -> None:
         profile = await _fetch_line_profile(user_id)
         _record_user(user_id, profile.get("displayName", ""))
 
-    # Forward to claude-runner /chat (blocking — Line reply token is valid ~30s so we must be fast enough)
+    # Show typing animation immediately so the user knows we're working.
+    await _line_loading(user_id, seconds=60)
+
     try:
         async with httpx.AsyncClient(timeout=120) as cli:
             r = await cli.post(f"{RUNNER_URL}/chat", json={
@@ -211,16 +221,40 @@ async def health(_: Request):
     })
 
 
+async def push(request: Request) -> JSONResponse:
+    """Simple HTTP push endpoint for internal callers (no MCP handshake needed).
+
+    POST /push {user_id?: str, text: str} — omit user_id to use the default.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "text is required"}, status_code=400)
+    user_id = body.get("user_id") or LINE_DEFAULT_USER
+    if not user_id:
+        return JSONResponse({"ok": False, "error": "no user_id and no default configured"}, status_code=400)
+    result = await _line_push(user_id, text)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+
 # ── Entry ─────────────────────────────────────────────────────────────────
 
 def build_app() -> Starlette:
+    # Mount MCP at root so its built-in /mcp route is reachable without a
+    # 307 redirect (Mount("/mcp", ...) appends trailing slash and breaks
+    # Claude Code's MCP client). Webhook + health win first via explicit
+    # routes; everything else falls into the FastMCP app.
     mcp_http = mcp.streamable_http_app()
     return Starlette(
         lifespan=getattr(mcp_http.router, "lifespan_context", None),
         routes=[
             Route("/webhook", webhook, methods=["POST"]),
             Route("/health", health, methods=["GET"]),
-            Mount("/mcp", app=mcp_http),
+            Route("/push", push, methods=["POST"]),
+            Mount("", app=mcp_http),
         ],
     )
 
